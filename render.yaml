@@ -1,0 +1,43 @@
+# Render blueprint. Create the service from this file (New → Blueprint) and fill
+# the four `sync: false` secrets in the dashboard afterwards.
+#
+# Two choices worth knowing about:
+#
+# * **`healthCheckPath: /healthz`** — that endpoint answers 200 as soon as the
+#   process is listening, *before* the MTProto handshake and the cold rebuild have
+#   finished. The check must pass within five seconds, and a Telegram login is
+#   not that fast. Readiness is reported in the body instead (`connected`,
+#   `index_ready`), and writes are refused with 503 NOT_READY until it is real.
+#
+# * **`plan: starter`, not `free`** — a free instance spins down after 15 minutes
+#   without traffic, which tears down the MTProto connection and blanks the
+#   in-memory index; the next request then pays a reconnect *and* a rebuild. It
+#   works, but every first request after a quiet spell is slow. Use `free` only to
+#   poke at it.
+services:
+  - type: web
+    name: vega-storage-backend
+    runtime: python
+    plan: starter
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn storage_backend.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # Secrets: `sync: false` means "do not read these from the blueprint".
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION
+        sync: false
+      - key: ZENTRAGRID_API_KEY
+        sync: false
+      # Everything else has a working default; see .env.example for the full list.
+      - key: ZG_HOT_COLLECTIONS
+        value: presence,typing,read_cursor
+      - key: ZG_HOT_SNAPSHOT
+        value: /tmp/vega-hot-store.json
+      - key: LOG_LEVEL
+        value: INFO

@@ -1,0 +1,18 @@
+# Secrets — a session string in a commit is a compromised account.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Local snapshots of the hot store
+vega-hot-store.json
+
+# Render
+.render/
