@@ -19,6 +19,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+
+# Windows terminals default to cp1252, which cannot encode every arrow and dash
+# this script prints. Losing a diagnostic line to a UnicodeEncodeError would be a
+# silly way to hide a real failure, so the stream is made forgiving up front.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):  # pragma: no cover - older interpreters
+    pass
 import urllib.error
 import urllib.request
 import uuid
@@ -63,12 +71,14 @@ def call(
     wanted = (expect,) if isinstance(expect, int) else expect
     if status not in wanted:
         FAILURES.append(
-            f"{method} {path} → {status}, expected {wanted}: {payload[:300]!r}"
+            f"{method} {path} -> {status}, expected {wanted}: {payload[:300]!r}"
         )
     try:
         parsed: dict | bytes = json.loads(payload) if payload else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         parsed = payload
+    # Header names are case-insensitive; a plain dict is not.
+    response_headers = {name.lower(): value for name, value in response_headers.items()}
     return status, parsed, response_headers
 
 
@@ -149,9 +159,12 @@ def main() -> int:
          f"status={status} rev={patched.get('rev')}")
 
     # -- stale write --------------------------------------------------- #
+    # `expected_rev` is the whole point of this step. Without it the patch is a
+    # plain merge and *succeeds*, which is exactly how an optimistic-concurrency
+    # check ends up quietly testing nothing.
     status, conflict, _ = call(
         base, key, "PATCH", f"/v1/data/{COLLECTION}/{doc_id}",
-        body={"data": {"text": "stale"}}, expect=409,
+        body={"data": {"text": "stale"}, "expected_rev": 1}, expect=409,
     )
     code = conflict.get("code") if isinstance(conflict, dict) else None
     step("a stale expected_rev is a 409 REVISION_CONFLICT",
@@ -198,7 +211,7 @@ def main() -> int:
         )
         step("a Range request is a 206 with the right slice",
              status == 206 and chunk == payload[100:200],
-             f"status={status} content-range={headers.get('Content-Range')}")
+             f"status={status} content-range={headers.get('content-range')}")
 
         call(base, key, "DELETE", f"/v1/files/{file_id}")
 
