@@ -159,6 +159,14 @@ class Config:
     # deletes it from the channel (removes the bytes for good).
     hard_delete: bool = False
 
+    # Application-level recovery continues after Telethon exhausts its retries.
+    connect_timeout: float = 60
+    probe_interval: float = 30
+    probe_timeout: float = 15
+    reconnect_initial_delay: float = 2
+    reconnect_max_delay: float = 60
+    rebuild_timeout: float = 600
+
     # Where the hot store snapshots itself. Ephemeral on Render by design.
     hot_snapshot_path: str = "/tmp/vega-hot-store.json"
 
@@ -243,6 +251,12 @@ def load_config() -> Config:
             0, _env_int("ZG_CHANNEL_MIN_INTERVAL_MS", 0)
         ),
         hard_delete=_env_bool("ZG_HARD_DELETE", False),
+        connect_timeout=max(1, _env_int("ZG_CONNECT_TIMEOUT_SECONDS", 60)),
+        probe_interval=max(1, _env_int("ZG_PROBE_INTERVAL_SECONDS", 30)),
+        probe_timeout=max(1, _env_int("ZG_PROBE_TIMEOUT_SECONDS", 15)),
+        reconnect_initial_delay=max(1, _env_int("ZG_RECONNECT_INITIAL_SECONDS", 2)),
+        reconnect_max_delay=max(1, _env_int("ZG_RECONNECT_MAX_SECONDS", 60)),
+        rebuild_timeout=max(1, _env_int("ZG_REBUILD_TIMEOUT_SECONDS", 600)),
         hot_snapshot_path=_env("ZG_HOT_SNAPSHOT", "/tmp/vega-hot-store.json"),
     )
 

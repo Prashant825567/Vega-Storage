@@ -51,6 +51,7 @@ class FakeTelegram:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.is_connected = False
         self.messages: dict[str, list[StoredMessage]] = {key: [] for key in config.channels}
         self.files: dict[str, dict[int, bytes]] = {key: {} for key in config.channels}
         self._next_id = 1000
@@ -62,8 +63,12 @@ class FakeTelegram:
     # -- lifecycle ----------------------------------------------------- #
 
     async def connect(self) -> None:
-        """The real gateway signs in here; the fake is always signed in."""
-        return None
+        """The real gateway signs in here; the fake has no credentials."""
+        self.is_connected = True
+
+    async def probe(self) -> None:
+        if not self.is_connected:
+            raise ConnectionError("fake transport disconnected")
 
     async def resolve_channels(self) -> dict[str, Any]:
         return self.resolved
@@ -78,7 +83,7 @@ class FakeTelegram:
         return {}
 
     async def close(self) -> None:
-        return None
+        self.is_connected = False
 
     def _new_id(self) -> int:
         self._next_id += 1

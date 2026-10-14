@@ -27,7 +27,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, File, Header, Query, Request, UploadFile
@@ -41,7 +43,7 @@ from .hotstore import HotStore
 from .index import ChannelIndex
 from .query import check_limit, parse_order_by, parse_where
 from .ranges import parse_range
-from .telegram import TelethonGateway
+from .telegram import LifecycleFloodWait, SessionUnavailableError, TelethonGateway
 
 log = logging.getLogger("storage_backend.app")
 
@@ -62,36 +64,116 @@ class Services:
         self.hot = HotStore(config)
         self.documents = DocumentStore(config, self.gateway, self.index, self.hot)
         self.files = FileStore(config, self.gateway, self.documents)
-        self.connected = False
+        self._connected = False
         self.connect_error: str | None = None
+        self.connection_state = "starting"
+        self.reconnect_attempts = 0
+        self.last_successful_probe: str | None = None
         self.snapshot_task: asyncio.Task[None] | None = None
-        self.rebuild_task: asyncio.Task[None] | None = None
+        self.supervisor_task: asyncio.Task[None] | None = None
+        self._rebuild_lock = asyncio.Lock()
 
     # -- lifecycle ----------------------------------------------------- #
 
-    async def bootstrap(self) -> None:
-        """Connect, load the hot snapshot, then rebuild the index."""
+    @property
+    def connected(self) -> bool:
+        # The flag reflects the last successful handshake/probe; the transport
+        # check also catches a fresh disconnect before the next probe runs.
+        return self._connected and self.gateway.is_connected
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "connected": self.connected,
+            "index_ready": self.index.ready,
+            "connect_error": self.connect_error,
+            "connection_state": (
+                "disconnected" if self.connection_state == "connected"
+                and not self.connected else self.connection_state
+            ),
+            "reconnect_attempts": self.reconnect_attempts,
+            "last_successful_probe": self.last_successful_probe,
+        }
+
+    async def _close_gateway(self) -> None:
         try:
-            await self.gateway.connect()
-            self.connected = True
-        except Exception as exc:
-            self.connect_error = f"{type(exc).__name__}: {exc}"
-            log.error("MTProto connect failed: %s", self.connect_error)
-            return
+            await asyncio.wait_for(self.gateway.close(), timeout=12)
+        except Exception:
+            log.warning("MTProto cleanup failed", exc_info=True)
+
+    async def bootstrap(self) -> None:
+        """One supervisor owns all connection attempts for this process.
+
+        Never replay failed writes: a timeout may follow an accepted Telegram
+        write. Recovery restores connectivity, not the in-flight HTTP request.
+        """
         try:
             self.hot.load()
         except Exception as exc:  # pragma: no cover - best effort
             log.warning("hot snapshot load failed: %s", exc)
-        await self.rebuild()
+
+        ceiling = self.config.reconnect_max_delay
+        initial_delay = min(self.config.reconnect_initial_delay, ceiling)
+        delay = initial_delay
+        while True:
+            try:
+                if not self.connected:
+                    self.connection_state = "connecting"
+                    self.reconnect_attempts += 1
+                    await asyncio.wait_for(
+                        self.gateway.connect(), timeout=self.config.connect_timeout
+                    )
+                    self._connected = True
+                    self.connect_error = None
+                # A healthy in-memory index survives a runtime reconnect. Only
+                # incomplete/failed cold rebuilds are retried automatically.
+                if not self.index.ready:
+                    self.connection_state = "rebuilding"
+                    await self.rebuild()
+                self.connection_state = "connected"
+                await asyncio.sleep(self.config.probe_interval)
+                await asyncio.wait_for(
+                    self.gateway.probe(), timeout=self.config.probe_timeout
+                )
+                self.last_successful_probe = datetime.now(timezone.utc).isoformat()
+                self.connect_error = None
+                delay = initial_delay
+            except asyncio.CancelledError:
+                raise
+            except SessionUnavailableError as exc:
+                self._connected = False
+                self.connection_state = "session_error"
+                self.connect_error = str(exc)
+                log.error("MTProto needs operator action: %s", exc)
+                await self._close_gateway()
+                return
+            except Exception as exc:
+                self._connected = False
+                self.connection_state = "recovering"
+                self.connect_error = f"{type(exc).__name__}: {exc}"
+                # Jitter prevents multiple processes retrying in lockstep.
+                # Flood waits are a lower bound, never capped by our backoff.
+                wait = min(ceiling, delay * random.uniform(1.0, 1.25))
+                if isinstance(exc, LifecycleFloodWait):
+                    wait = max(wait, exc.seconds)
+                log.warning("MTProto recovery in %.1fs: %s", wait, self.connect_error)
+                await self._close_gateway()
+                await asyncio.sleep(wait)
+                delay = min(ceiling, delay * 2)
 
     async def rebuild(self) -> None:
-        try:
-            await self.index.rebuild(self.gateway)
-        except Exception as exc:  # pragma: no cover - defensive
-            log.error("cold rebuild crashed: %s", exc)
+        async with self._rebuild_lock:
+            if not self.connected:
+                raise not_ready("MTProto is reconnecting")
+            await asyncio.wait_for(
+                self.index.rebuild(self.gateway), timeout=self.config.rebuild_timeout
+            )
+            if not self.index.ready:
+                raise not_ready("channel rebuild failed; see /v1/status index.rebuild_errors")
 
     async def shutdown(self) -> None:
-        for task in (self.rebuild_task, self.snapshot_task):
+        self._connected = False
+        self.connection_state = "stopping"
+        for task in (self.supervisor_task, self.snapshot_task):
             if task is not None and not task.done():
                 task.cancel()
                 try:
@@ -102,7 +184,7 @@ class Services:
             self.hot.save()
         except Exception:  # pragma: no cover
             pass
-        await self.gateway.close()
+        await self._close_gateway()
 
 
 def build_app(
@@ -119,7 +201,9 @@ def build_app(
         )
         app.state.services = services
         # The port opens immediately; Telegram and the index catch up behind it.
-        services.rebuild_task = asyncio.create_task(services.bootstrap())
+        services.supervisor_task = asyncio.create_task(
+            services.bootstrap(), name="mtproto-supervisor"
+        )
         services.snapshot_task = asyncio.create_task(_snapshot_loop(services))
         try:
             yield
@@ -188,15 +272,17 @@ def build_app(
     @app.get("/healthz")
     async def healthz(request: Request) -> dict[str, Any]:
         services = services_for(request)
-        return {
-            "ok": True,
-            # Reported, never enforced: the check answers 200 as soon as the
-            # process is up, because a slow Telegram handshake must not look
-            # like a dead service.
-            "connected": services.connected,
-            "index_ready": services.index.ready,
-            "connect_error": services.connect_error,
-        }
+        # Liveness stays 200 while recovery runs; it must not cause restart
+        # loops during a Telegram outage. Readiness is a separate endpoint.
+        return {"ok": True, **services.health()}
+
+    @app.get("/readyz")
+    async def readyz(request: Request) -> JSONResponse:
+        services = services_for(request)
+        ready = services.connected and services.index.ready
+        return JSONResponse(
+            {"ok": ready, **services.health()}, status_code=200 if ready else 503
+        )
 
     @app.get("/")
     async def root() -> dict[str, Any]:
@@ -209,8 +295,7 @@ def build_app(
     @app.get("/v1/status")
     async def status(_: Services = Depends(require_key)) -> dict[str, Any]:
         return {
-            "connected": _.connected,
-            "connect_error": _.connect_error,
+            **_.health(),
             "channels": {
                 key: {
                     "title": channel.title,

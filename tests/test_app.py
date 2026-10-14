@@ -12,6 +12,7 @@ network are involved.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 
@@ -34,6 +35,14 @@ class AppCase(unittest.TestCase):
         self.client = TestClient(self.app)
         # Entering the context runs the lifespan: connect (no-op) + cold rebuild.
         self.client.__enter__()
+        # Startup intentionally runs in the background. Do not depend on the
+        # scheduler finishing the handshake/rebuild before TestClient enters.
+        async def wait_ready():
+            async def poll():
+                while not self.app.state.services.index.ready:
+                    await asyncio.sleep(0.001)
+            await asyncio.wait_for(poll(), timeout=2)
+        self.client.portal.call(wait_ready)
 
     def tearDown(self) -> None:
         self.client.__exit__(None, None, None)

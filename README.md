@@ -62,7 +62,7 @@ out from under unrelated tools that pin older versions.
    and prints a string. Never run this on Render; it is interactive on purpose.
 2. **Create the service** from `render.yaml` (New → Blueprint), or manually with:
    - build: `pip install -r requirements.txt`
-   - start: `uvicorn storage_backend.app:app --host 0.0.0.0 --port $PORT`
+   - start: `uvicorn storage_backend.app:app --host 0.0.0.0 --port $PORT --workers 1`
    - health check path: `/healthz`
 3. **Set four secrets** in Environment:
 
@@ -72,8 +72,10 @@ out from under unrelated tools that pin older versions.
    | `TELEGRAM_API_HASH` | from my.telegram.org |
    | `TELEGRAM_SESSION` | the string from step 1 (**bearer credential**) |
    | `ZENTRAGRID_API_KEY` | the key the panel/app send as `Authorization: Bearer …` |
-4. **Verify**: `python scripts/check_channels.py` locally, then
-   `python scripts/smoke.py https://<service>.onrender.com`.
+4. **Verify**: run `python scripts/check_channels.py` locally **before** the
+   hosted instance starts (never share its session with a concurrent process),
+   then `python scripts/smoke.py https://<service>.onrender.com`. Check `/readyz`
+   returns 200 once the connection and index are ready.
 
 ### Pointing the clients at it
 
@@ -104,7 +106,8 @@ carries both `error` spellings plus a `code`.
 | `PATCH` | `/v1/files/{id}` | `{name}` — **metadata only**, never a re-upload |
 | `DELETE` | `/v1/files/{id}` | removes the record (bytes too when `ZG_HARD_DELETE=true`) |
 | `GET` | `/v1/files/{id}/download` | bytes, with `Range` → `206` for seeking |
-| `GET` | `/healthz` | 200 as soon as the port is up (see below) |
+| `GET` | `/healthz` | Liveness: 200 while the HTTP process is up; includes connection state |
+| `GET` | `/readyz` | Readiness: 200 only with connected MTProto and a complete index; otherwise 503 |
 | `GET` | `/v1/status` | channels, index stats, hot store stats, routes |
 | `POST` | `/v1/admin/rebuild` | re-run the cold rebuild on demand |
 
@@ -138,6 +141,64 @@ poll would be both slow and a flood-wait magnet.
 `/healthz` answers 200 immediately and reports readiness separately, because
 Render's health check must pass within five seconds and an MTProto login plus a
 rebuild is not that fast. Until the index is real, writes get `503 NOT_READY`.
+
+### MTProto recovery (no manual redeploy for transient outages)
+
+A single background supervisor owns connection attempts. It retries transient
+startup/network failures indefinitely using exponential backoff (2 seconds up to
+60 seconds, with jitter). Telethon's built-in reconnect remains enabled; the
+supervisor also recovers after Telethon exhausts its own retries.
+
+- Every 30 seconds a real, read-only Telegram RPC checks responsiveness, with a
+  15-second timeout. Connection setup has a 60-second timeout. A hung socket cannot
+  leave the service stuck forever; actual recovery also depends on network and
+  Telegram availability and cleanup time.
+- `/healthz` is **liveness**, so leave Render's health-check path on `/healthz`.
+  `/readyz` returns **503** during startup, disconnection or incomplete rebuilds.
+  Do not use readiness as a restart trigger: Telegram outages should not create
+  process restart loops. `connected` checks the transport flag as well as the
+  last successful handshake/probe; a half-open socket is detected at the next
+  bounded probe, not synchronously by HTTP health requests.
+- `/healthz`, `/readyz` and authenticated `/v1/status` expose `connection_state`,
+  `connect_error`, `reconnect_attempts` (including the initial attempt), and
+  `last_successful_probe` (UTC; null until the first periodic probe succeeds).
+- A healthy in-memory index survives reconnects: no full history scan on every
+  brief network drop. Startup/failed rebuilds are retried. A scan error is no
+  longer silently mistaken for end-of-history. All configured channels must scan
+  successfully before writes become ready; check `index.rebuild_errors` in
+  `/v1/status`. Failed scans retain the previously published index for cached
+  reads, which may be stale. New rebuilds are staged before publication.
+- Telegram flood waits during recovery are honored in full, even when longer
+  than the backoff ceiling. Write flood waits still return `429` + `Retry-After`.
+- A revoked/invalid/duplicate session stops retries with
+  `connection_state: session_error`. Replace the bad credentials/session and
+  restart once; restarting repeatedly cannot repair revoked credentials. Login
+  in the server is non-interactive (no phone/code prompts).
+- Recovery does **not** replay in-flight writes or uploads. An interrupted write
+  can have an unknown outcome; reconcile it before retrying to avoid duplicates.
+- Use **one worker and one service instance**. The Render start command explicitly
+  sets `--workers 1`, overriding `WEB_CONCURRENCY`. Do not run local checks or
+  another deployment concurrently with the same session. Avoid old/new instance
+  overlap during deployments; use stop-before-start if your hosting setup permits
+  it. The application supervisor is process-local, not a distributed lock.
+- A sleeping/stopped Render Free instance cannot run a supervisor. Use an
+  always-on plan if continuous availability is required. This also cannot fix
+  Telegram bans, persistent network restrictions, missing channel permissions,
+  OOM kills, or other host-level failures.
+
+Optional settings (all in seconds; see `.env.example`):
+
+| Variable | Default |
+|---|---:|
+| `ZG_CONNECT_TIMEOUT_SECONDS` | 60 |
+| `ZG_PROBE_INTERVAL_SECONDS` | 30 |
+| `ZG_PROBE_TIMEOUT_SECONDS` | 15 |
+| `ZG_RECONNECT_INITIAL_SECONDS` | 2 |
+| `ZG_RECONNECT_MAX_SECONDS` | 60 |
+| `ZG_REBUILD_TIMEOUT_SECONDS` | 600 |
+
+No new secrets are required. Raise the rebuild timeout for histories that take
+longer than ten minutes; otherwise each timed-out scan will be retried.
 
 ### Layer 2 — one lock per document
 
@@ -229,6 +290,9 @@ stdlib. `pip install httpx` if the API tests skip on import.
 | `503 CHANNEL_UNAVAILABLE` | The account is not a member, or the id is wrong. Run `check_channels.py`; a `ValueError` means the account has never seen that channel, so open it once in that account's Telegram app. |
 | `429 RATE_LIMITED` with `Retry-After` | Telegram flood control. Raise `ZG_CHANNEL_MIN_INTERVAL_MS`, or check whether something is writing per-message where it should write per-document. |
 | `503 NOT_READY` right after deploy | Normal for the first seconds: the handshake and rebuild are still running. `/v1/status` shows `index.rebuilt_at`. |
+| `connection_state: recovering` | Automatic recovery is running. Inspect `connect_error`; no manual redeploy is needed for a transient outage. |
+| `connection_state: session_error` | Credentials/session need attention. Stop duplicate instances, fix/replace the session, then restart once. |
+| `index.rebuild_errors` or repeated rebuild timeouts | Fix channel membership/IDs or increase `ZG_REBUILD_TIMEOUT_SECONDS` for large histories. Writes remain unready rather than using a partial index. |
 | Everything vanished after a redeploy | Expected for hot collections (`presence`). Documents live in the channels and come back on the next rebuild. |
 | `400 VALIDATION_ERROR` on a big query | The page ceiling is 200, exactly like ZentraGrid. Page with `cursor`. |
 

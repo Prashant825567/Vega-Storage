@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .config import Config
-from .telegram import StoredMessage, TelegramLike
+from .telegram import LifecycleFloodWait, SessionUnavailableError, StoredMessage, TelegramLike
 from .wire import assemble, decode
 
 log = logging.getLogger("storage_backend.index")
@@ -153,6 +153,24 @@ class ChannelIndex:
     # ------------------------------------------------------------------ #
 
     async def rebuild(self, gateway: TelegramLike, *, keep: bool = False) -> None:
+        self.ready = False
+        candidate = ChannelIndex(self._config)
+        if keep:
+            candidate._docs = {key: dict(value) for key, value in self._docs.items()}
+            candidate._by_message = dict(self._by_message)
+        await candidate._scan(gateway, keep=keep)
+        self.rebuild_errors = candidate.rebuild_errors
+        if candidate.rebuild_errors:
+            return
+        # No awaits during publication; readers never see a half-built index.
+        self._docs = candidate._docs
+        self._by_message = candidate._by_message
+        self.scanned_messages = candidate.scanned_messages
+        self.dropped_incomplete = candidate.dropped_incomplete
+        self.rebuilt_at = candidate.rebuilt_at
+        self.ready = True
+
+    async def _scan(self, gateway: TelegramLike, *, keep: bool = False) -> None:
         """Index every channel from scratch.
 
         Runs once at startup (in the background, so the port opens immediately)
@@ -178,6 +196,8 @@ class ChannelIndex:
                     grouped.setdefault(
                         (record.collection, record.doc_id, record.rev), []
                     ).append((message.id, record))
+            except (LifecycleFloodWait, SessionUnavailableError):
+                raise
             except Exception as exc:
                 self.rebuild_errors[key] = f"{type(exc).__name__}: {exc}"
                 log.warning("rebuild of %s failed: %s", key, exc)

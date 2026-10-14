@@ -42,6 +42,32 @@ PART_ALIGNMENT = 4096
 DEFAULT_REQUEST_SIZE = 512 * 1024
 
 
+class SessionUnavailableError(RuntimeError):
+    """Credentials/session need operator intervention, not a reconnect storm."""
+
+
+class LifecycleFloodWait(RuntimeError):
+    def __init__(self, seconds: int) -> None:
+        self.seconds = max(1, seconds)
+        super().__init__(f"Telegram requested a {self.seconds}s recovery cooldown")
+
+
+def _lifecycle_error(exc: Exception) -> Exception:
+    from telethon import errors
+
+    if isinstance(exc, (
+        errors.UnauthorizedError, errors.AuthKeyDuplicatedError, errors.ApiIdInvalidError
+    )):
+        return SessionUnavailableError(
+            f"{type(exc).__name__}: Telegram session rejected. Check credentials, "
+            "ensure this session is not shared by other deployments, and replace "
+            "TELEGRAM_SESSION if revoked/invalid."
+        )
+    if isinstance(exc, errors.FloodWaitError):
+        return LifecycleFloodWait(exc.seconds)
+    return exc
+
+
 @dataclass
 class StoredMessage:
     """What a caller needs to know about one channel message."""
@@ -59,6 +85,13 @@ class StoredMessage:
 @runtime_checkable
 class TelegramLike(Protocol):
     """The channel operations the store needs. Fake implementations are welcome."""
+
+    @property
+    def is_connected(self) -> bool: ...
+
+    async def connect(self) -> None: ...
+
+    async def probe(self) -> None: ...
 
     async def resolve_channels(self) -> dict[str, Any]: ...
 
@@ -126,33 +159,74 @@ class TelethonGateway:
     # Lifecycle
     # ------------------------------------------------------------------ #
 
+    @property
+    def is_connected(self) -> bool:
+        return self._client is not None and self._client.is_connected()
+
     async def connect(self) -> None:
-        """Connect (and log in) once, on the server's own event loop."""
-        # Imported here so the pure unit tests never need Telethon installed.
+        """Non-interactive login; the service supervisor owns reconnects."""
         from telethon import TelegramClient
         from telethon.sessions import StringSession
 
+        await self.close()
         config = self._config
+        try:
+            session = StringSession(config.session)
+            if session.auth_key is None:
+                raise ValueError("Empty session")
+        except Exception as exc:
+            # Do not include the supplied session string in logs or responses.
+            raise SessionUnavailableError("Invalid TELEGRAM_SESSION; generate a new session") from exc
+
         client = TelegramClient(
-            StringSession(config.session),
-            config.api_id,
-            config.api_hash,
+            session, config.api_id, config.api_hash,
+            auto_reconnect=True, connection_retries=5, retry_delay=1,
+            flood_sleep_threshold=0,
         )
-        # This service handles flood waits itself: a request must never hang for
-        # minutes waiting on Telegram. Anything above zero seconds is raised.
-        client.flood_sleep_threshold = 0
-        await client.start()
+        # Register before awaiting, so a timeout/cancellation can clean it up.
         self._client = client
+        try:
+            await client.connect()
+            # is_user_authorized() swallows *all* RPC errors (including flood
+            # waits) as False. get_me() only treats auth rejection as logged out.
+            if await client.get_me() is None:
+                raise SessionUnavailableError(
+                    "TELEGRAM_SESSION is not authorized; generate a new session"
+                )
+            await self.resolve_channels()
+        except asyncio.CancelledError:
+            await self.close()
+            raise
+        except Exception as exc:
+            await self.close()
+            translated = _lifecycle_error(exc)
+            if translated is exc:
+                raise
+            raise translated from exc
         log.info("MTProto session is up (api_id=%s)", config.api_id)
-        await self.resolve_channels()
+
+    async def probe(self) -> None:
+        """A real RPC, not just a cached socket flag. Timeout is owned by caller."""
+        if not self.is_connected:
+            raise ConnectionError("MTProto transport is disconnected")
+        try:
+            if await self._client.get_me() is None:
+                raise SessionUnavailableError("Telegram session is no longer authorized")
+        except Exception as exc:
+            translated = _lifecycle_error(exc)
+            if translated is exc:
+                raise
+            raise translated from exc
 
     async def close(self) -> None:
-        if self._client is not None:
+        client, self._client = self._client, None
+        self._peers = {}
+        self._unresolved = {}
+        if client is not None:
             try:
-                await self._client.disconnect()
-            except Exception:  # pragma: no cover - shutdown best effort
+                await asyncio.wait_for(client.disconnect(), timeout=10)
+            except Exception:  # shutdown best effort, including timeout
                 log.debug("disconnect failed", exc_info=True)
-            self._client = None
 
     # ------------------------------------------------------------------ #
     # Peers
@@ -189,10 +263,13 @@ class TelethonGateway:
             try:
                 peers[key] = await self._resolve_one(channel, PeerChannel)
             except Exception as exc:
+                translated = _lifecycle_error(exc)
+                if translated is not exc:
+                    raise translated from exc
                 unresolved[key] = f"{type(exc).__name__}: {exc}"
                 log.warning("channel %s (%s) unresolved: %s", key, channel.title, exc)
 
-        if unresolved and len(unresolved) < len(self._config.channels):
+        if unresolved:
             # Only worth the (expensive) dialog walk when at least one channel is
             # still missing — a full walk on every start is a lot of traffic.
             try:
@@ -203,6 +280,9 @@ class TelethonGateway:
                         peers[key] = peer
                         unresolved.pop(key)
             except Exception as exc:  # pragma: no cover - best effort
+                translated = _lifecycle_error(exc)
+                if translated is not exc:
+                    raise translated from exc
                 log.warning("dialog walk failed: %s", exc)
 
         self._peers = peers
@@ -215,7 +295,10 @@ class TelethonGateway:
             return await self._client.get_input_entity(
                 peer_cls(unmark_channel_id(channel.peer_id))
             )
-        except Exception:
+        except Exception as exc:
+            translated = _lifecycle_error(exc)
+            if translated is not exc:
+                raise translated from exc
             # Some sessions accept the marked id directly; try before giving up.
             entity = await self._client.get_entity(channel.peer_id)
             return await self._client.get_input_entity(entity)
@@ -369,10 +452,12 @@ class TelethonGateway:
                     ):
                         batch.append(_stored_from_message(message))
                 except Exception as exc:
-                    # A history walk is a best-effort rebuild: log it, keep the
-                    # messages already read, and let the service serve what it has.
-                    log.warning("history walk on %s stopped early: %s", key, exc)
-                    break
+                    # Never silently publish a truncated history as ready.
+                    log.warning("history walk on %s failed: %s", key, exc)
+                    translated = _lifecycle_error(exc)
+                    if translated is not exc:
+                        raise translated from exc
+                    raise
                 if not batch:
                     break
                 for item in batch:
